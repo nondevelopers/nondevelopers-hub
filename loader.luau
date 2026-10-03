@@ -1,11 +1,10 @@
 if not game:IsLoaded() then game.Loaded:Wait() end
 
-local BASE = "https://raw.githubusercontent.com/nondevelopers/nondev-scripts/main/"
+local BASE = "https://raw.githubusercontent.com/nondevelopers/nondevelopers-hub/main/"
 local FALLBACK = "hub.luau"
 
 local SUPPORTED = {
-    -- [1234567890] = "games/example_game.luau",
-    -- [9876543210] = "games/another_game.luau",
+   [79393329652220] = "games/Defusal.luau",
 }
 
 local env = getgenv()
