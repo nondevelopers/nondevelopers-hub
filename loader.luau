@@ -1,22 +1,12 @@
---[[
-    nondevelopers loader
-    One script to execute. Picks the right script for the current game,
-    falls back to the universal hub when the game is not supported.
-]]--
-
 if not game:IsLoaded() then game.Loaded:Wait() end
 
--- config -------------------------------------------------------------
 local BASE = "https://raw.githubusercontent.com/nondevelopers/nondev-scripts/main/"
-local FALLBACK = "hub.luau" -- your current nondevelopers_hub.luau
+local FALLBACK = "hub.luau"
 
--- key = game.GameId (universe, covers every place of the game)
---       or game.PlaceId (one specific place; checked first)
 local SUPPORTED = {
     -- [1234567890] = "games/example_game.luau",
     -- [9876543210] = "games/another_game.luau",
 }
------------------------------------------------------------------------
 
 local env = getgenv()
 if env.NonDevLoaded then return end -- block double execution
