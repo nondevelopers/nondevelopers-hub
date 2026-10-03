@@ -8,7 +8,7 @@ local SUPPORTED = {
 }
 
 local env = getgenv()
-if env.NonDevLoaded then return end -- block double execution
+if env.NonDevLoaded then return end
 env.NonDevLoaded = true
 
 local function run(path)
