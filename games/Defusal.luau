@@ -45,6 +45,7 @@ local Settings = {
     Health = false,
     Chams = false,
     NoRec = false,
+    NoSpread = false,
     InfAmo = false,
     RapidFire = false,
 }
@@ -387,51 +388,74 @@ RunService:BindToRenderStep(LOCK_NAME, Enum.RenderPriority.Last.Value, function(
     camera.CFrame = CFrame.new(camera.CFrame.Position, part.Position)
 end)
 
-local recoilWords = {"recoil", "spread", "sway", "bloom", "kick"}
+local NAME_KINDS = {}
 
-local ammoNames = {}
-for _, n in ipairs({
-    "ammo", "currentammo", "curammo", "clipammo", "magammo", "ammoinclip", "storedammo",
-    "reserveammo", "totalammo", "bullets", "maxammo", "clipsize", "magsize", "magazinesize",
-}) do ammoNames[n] = true end
+local function addNames(kind, list)
+    for _, n in ipairs(list) do
+        NAME_KINDS[n] = kind
+    end
+end
 
-local rateNames = {}
-for _, n in ipairs({
-    "firerate", "fire_rate", "rpm", "firedelay", "shootdelay", "shootcooldown",
-    "firecooldown", "rateoffire", "rof", "cooldown",
-}) do rateNames[n] = true end
+addNames("ammo", {"ammo", "currentammo", "curammo", "clipammo", "magammo", "ammoinclip", "loadedammo", "ammocount", "bullets", "currentbullets"})
+addNames("reserve", {"storedammo", "reserveammo", "totalammo", "ammostored", "ammoreserve", "reserve", "stored", "spareammo", "extraammo"})
+addNames("capacity", {"maxammo", "clipsize", "magsize", "magazinesize", "maxclip", "maxmag", "magcapacity", "clipcapacity"})
+addNames("rate", {"firerate", "fire_rate", "rpm", "firedelay", "shootdelay", "shootcooldown", "firecooldown", "rateoffire", "rof", "cooldown", "shotdelay", "bulletdelay", "timebetweenshots", "fireinterval"})
+
+local KIND_WORDS = {
+    {kind = "recoil", words = {"recoil", "kick", "sway"}},
+    {kind = "spread", words = {"spread", "bloom", "inaccuracy", "deviation"}},
+}
+
+local HINT_NAMES = {Variables = true, Shucky = true, Ambassador = true}
+local FAST_KEYS = {"Ammo", "StoredAmmo", "CurrentAmmo", "ReserveAmmo", "Recoil", "Spread", "FireRate", "Bloom", "Sway"}
 
 local classCache = {}
+local entries = {}
+local entryOf = setmetatable({}, {__mode = "k"})
+local frozenTables = {}
+local gunTables = {}
+local known = {}
+local toolTargets = {}
+local toolConns = {}
+local scanning = false
+local scanRequested = true
+local scanAgain = false
+local notifyNext = false
+local lastScan = 0
 
 local function classify(key)
-    local cached = classCache[key]
-    if cached ~= nil then
-        if cached then return cached[1], cached[2] end
+    local c = classCache[key]
+    if c ~= nil then
+        if c then return c end
         return nil
     end
     local lk = string.lower(key)
-    local kind
-    for _, w in ipairs(recoilWords) do
-        if lk:find(w, 1, true) then kind = "recoil" break end
+    local kind = NAME_KINDS[lk]
+    if not kind then
+        for _, group in ipairs(KIND_WORDS) do
+            for _, w in ipairs(group.words) do
+                if lk:find(w, 1, true) then
+                    kind = group.kind
+                    break
+                end
+            end
+            if kind then break end
+        end
     end
-    if not kind and ammoNames[lk] then kind = "ammo" end
-    if not kind and rateNames[lk] then kind = "rate" end
-    if kind then
-        classCache[key] = {kind, lk}
-        return kind, lk
-    end
-    classCache[key] = false
-    return nil
+    classCache[key] = kind or false
+    return kind
 end
 
 local function kindEnabled(kind)
-    return (kind == "recoil" and Settings.NoRec)
-        or (kind == "ammo" and Settings.InfAmo)
-        or (kind == "rate" and Settings.RapidFire)
+    if kind == "recoil" then return Settings.NoRec end
+    if kind == "spread" then return Settings.NoSpread end
+    if kind == "ammo" or kind == "reserve" then return Settings.InfAmo end
+    if kind == "rate" then return Settings.RapidFire end
+    return false
 end
 
 local function anyGunMod()
-    return Settings.NoRec or Settings.InfAmo or Settings.RapidFire
+    return Settings.NoRec or Settings.NoSpread or Settings.InfAmo or Settings.RapidFire
 end
 
 local function unlock(t)
@@ -440,140 +464,372 @@ local function unlock(t)
     end
 end
 
-local originals = setmetatable({}, {__mode = "k"})
-
-local function writeValue(container, key, mode, value)
-    if mode == "table" then
-        unlock(container)
-        rawset(container, key, value)
-    elseif mode == "value" then
-        container.Value = value
-    else
-        container:SetAttribute(key, value)
-    end
-end
-
-local function remember(container, key, rec)
-    local map = originals[container]
-    if not map then
-        map = {}
-        originals[container] = map
-    end
-    map[key] = rec
-    return rec
-end
-
-local function applyValue(container, key, current, mode)
-    local kind, lk = classify(key)
-    if not kind or not kindEnabled(kind) then return end
-    local map = originals[container]
-    local rec = map and map[key]
-    local t = typeof(current)
-
-    if kind == "recoil" then
-        if t == "number" then
-            if current ~= 0 then
-                if not rec then remember(container, key, {kind = kind, mode = mode, val = current}) end
-                writeValue(container, key, mode, 0)
-            end
-        elseif t == "Vector3" or t == "Vector2" then
-            local zero = t == "Vector3" and Vector3.zero or Vector2.zero
-            if current ~= zero then
-                if not rec then remember(container, key, {kind = kind, mode = mode, val = current}) end
-                writeValue(container, key, mode, zero)
-            end
-        elseif t == "table" and mode == "table" then
-            local saved = rec and rec.val or {}
-            local changed = false
-            unlock(current)
-            for k, v in next, current do
-                if type(v) == "number" and v ~= 0 then
-                    if saved[k] == nil then saved[k] = v end
-                    rawset(current, k, 0)
-                    changed = true
-                end
-            end
-            if changed and not rec then
-                remember(container, key, {kind = kind, mode = mode, nested = current, val = saved})
-            end
-        end
-        return
-    end
-
-    if t ~= "number" then return end
-    if not rec then rec = remember(container, key, {kind = kind, mode = mode, val = current}) end
-    local newValue
-    if kind == "ammo" then
-        newValue = 99999
-    elseif lk:find("rpm", 1, true) or lk:find("rof", 1, true) or rec.val > 20 then
-        newValue = 3000
-    else
-        newValue = 0.02
-    end
-    if current ~= newValue then
-        writeValue(container, key, mode, newValue)
-    end
-end
-
-local function restoreDisabled()
-    for container, map in pairs(originals) do
-        for key, rec in pairs(map) do
-            if not kindEnabled(rec.kind) then
-                if rec.nested then
-                    pcall(function()
-                        unlock(rec.nested)
-                        for k, v in pairs(rec.val) do rawset(rec.nested, k, v) end
-                    end)
-                else
-                    pcall(writeValue, container, key, rec.mode, rec.val)
-                end
-                map[key] = nil
-            end
-        end
-    end
-end
-
-local gunTables = {}
-local scanRequested = true
-local lastScan = 0
-
-local function requestScan()
-    scanRequested = true
-end
-
 local function usable(kind, v)
     local t = typeof(v)
-    if kind == "recoil" then
+    if kind == "recoil" or kind == "spread" then
         return t == "number" or t == "Vector3" or t == "Vector2" or t == "table"
     end
     return t == "number"
 end
 
-local function scanGC()
-    if type(getgc) ~= "function" then return end
-    local found = {}
-    local n = 0
-    for _, obj in ipairs(getgc(true)) do
-        n += 1
-        if n % 3000 == 0 then task.wait() end
-        if type(obj) == "table" and obj ~= Settings and obj ~= originals and obj ~= gunTables and obj ~= classCache then
-            local keys = {}
-            pcall(function()
-                for k, v in next, obj do
-                    if type(k) == "string" then
-                        local kind = classify(k)
-                        if kind and usable(kind, v) then keys[#keys + 1] = k end
+local function inspectTable(t, relaxed)
+    local keys, cap, count = {}, nil, 0
+    pcall(function()
+        for k, v in next, t do
+            if type(k) == "string" then
+                local kind = classify(k)
+                if kind then
+                    if kind == "capacity" then
+                        count = count + 1
+                        if type(v) == "number" and (not cap or v > cap) then cap = v end
+                    elseif usable(kind, v) then
+                        count = count + 1
+                        keys[#keys + 1] = k
                     end
                 end
-            end)
-            if #keys >= 2 then found[#found + 1] = {tbl = obj, keys = keys} end
+            end
         end
+    end)
+    if #keys >= 1 and count >= (relaxed and 1 or 2) then
+        return {tbl = t, keys = keys, cap = cap}
     end
-    gunTables = found
+    return nil
 end
 
-local toolConns = {}
-local toolTargets = {}
+local function rateTarget(lk, cur)
+    if lk:find("delay", 1, true) or lk:find("cooldown", 1, true) or lk:find("interval", 1, true) or lk:find("between", 1, true) then
+        return 0.02
+    end
+    if lk:find("rpm", 1, true) then return 3000 end
+    if cur <= 1 then return 0.02 end
+    return math.min(cur * 3, 3000)
+end
+
+local function targetFor(kind, key, current, cap)
+    local t = typeof(current)
+    if kind == "recoil" or kind == "spread" then
+        if t == "number" then return 0 end
+        if t == "Vector3" then return Vector3.zero end
+        if t == "Vector2" then return Vector2.zero end
+        return nil
+    end
+    if t ~= "number" then return nil end
+    if kind == "ammo" then
+        local v = math.max(current, cap or 0)
+        if v < 1 then v = 30 end
+        return v
+    end
+    if kind == "reserve" then return math.max(current, 999) end
+    if kind == "rate" then return rateTarget(string.lower(key), current) end
+    return nil
+end
+
+local function readValue(e)
+    if e.mode == "table" then return rawget(e.container, e.key) end
+    if e.mode == "value" then return e.container.Value end
+    return e.container:GetAttribute(e.key)
+end
+
+local function writeValue(e, value)
+    if e.mode == "table" then
+        unlock(e.container)
+        rawset(e.container, e.key, value)
+    elseif e.mode == "value" then
+        e.container.Value = value
+    else
+        e.container:SetAttribute(e.key, value)
+    end
+end
+
+local function zeroNested(e)
+    local nested = e.nested
+    unlock(nested)
+    for k, v in next, nested do
+        if type(v) == "number" and v ~= 0 then
+            if e.saved[k] == nil then e.saved[k] = v end
+            rawset(nested, k, 0)
+        end
+    end
+end
+
+local function freezeKey(t, key, value)
+    if type(setrawmetatable) ~= "function" or type(getrawmetatable) ~= "function" then
+        return false
+    end
+    local info = frozenTables[t]
+    if info then
+        pcall(unlock, t)
+        if not pcall(rawset, t, key, nil) then return false end
+        info.vals[key] = value
+        return true
+    end
+    return pcall(function()
+        unlock(t)
+        local oldmt = getrawmetatable(t)
+        local oldIndex = oldmt and rawget(oldmt, "__index")
+        local oldNewIndex = oldmt and rawget(oldmt, "__newindex")
+        local vals = {[key] = value}
+        local newmt = {}
+        if oldmt then
+            for k, v in next, oldmt do newmt[k] = v end
+        end
+        newmt.__index = function(self, k)
+            local v = vals[k]
+            if v ~= nil then return v end
+            if type(oldIndex) == "function" then return oldIndex(self, k) end
+            if oldIndex ~= nil then return oldIndex[k] end
+            return nil
+        end
+        newmt.__newindex = function(self, k, v)
+            if vals[k] ~= nil then return end
+            if type(oldNewIndex) == "function" then
+                oldNewIndex(self, k, v)
+            elseif oldNewIndex ~= nil then
+                oldNewIndex[k] = v
+            else
+                rawset(self, k, v)
+            end
+        end
+        setrawmetatable(t, newmt)
+        if not pcall(rawset, t, key, nil) then
+            setrawmetatable(t, oldmt)
+            error("rawset failed")
+        end
+        frozenTables[t] = {vals = vals, oldmt = oldmt}
+    end)
+end
+
+local function unfreeze(e)
+    local t = e.container
+    local info = frozenTables[t]
+    local restore = e.orig
+    if e.kind == "ammo" or e.kind == "reserve" then restore = e.target end
+    if info then
+        info.vals[e.key] = nil
+        pcall(unlock, t)
+        pcall(rawset, t, e.key, restore)
+        if next(info.vals) == nil then
+            pcall(setrawmetatable, t, info.oldmt)
+            frozenTables[t] = nil
+        end
+    else
+        pcall(rawset, t, e.key, restore)
+    end
+end
+
+local function releaseEntry(e)
+    if e.nested then
+        unlock(e.nested)
+        for k, v in pairs(e.saved) do rawset(e.nested, k, v) end
+    elseif e.frozen then
+        unfreeze(e)
+    elseif e.kind ~= "ammo" and e.kind ~= "reserve" then
+        writeValue(e, e.orig)
+    end
+end
+
+local function ensureEntry(container, key, current, mode, cap)
+    local kind = classify(key)
+    if not kind or kind == "capacity" or not kindEnabled(kind) then return end
+    local map = entryOf[container]
+    if map and map[key] then return end
+    local e
+    if type(current) == "table" then
+        if (kind ~= "recoil" and kind ~= "spread") or mode ~= "table" then return end
+        e = {kind = kind, container = container, key = key, mode = mode, nested = current, saved = {}}
+    else
+        local target = targetFor(kind, key, current, cap)
+        if target == nil then return end
+        e = {kind = kind, container = container, key = key, mode = mode, orig = current, target = target}
+    end
+    if not map then
+        map = {}
+        entryOf[container] = map
+    end
+    map[key] = e
+    entries[#entries + 1] = e
+    if e.nested then
+        pcall(zeroNested, e)
+    elseif mode == "table" and freezeKey(container, key, e.target) then
+        e.frozen = true
+    else
+        pcall(writeValue, e, e.target)
+    end
+end
+
+local function enforce(e)
+    if e.nested then
+        local cur = rawget(e.container, e.key)
+        if type(cur) == "table" and cur ~= e.nested then
+            e.nested = cur
+            e.saved = {}
+        end
+        zeroNested(e)
+        return
+    end
+    if e.frozen then
+        if rawget(e.container, e.key) ~= nil then
+            pcall(unlock, e.container)
+            pcall(rawset, e.container, e.key, nil)
+        end
+        return
+    end
+    local cur = readValue(e)
+    if cur ~= nil and cur ~= e.target then
+        writeValue(e, e.target)
+    end
+end
+
+local function restoreDisabled()
+    local i = 1
+    while i <= #entries do
+        local e = entries[i]
+        if kindEnabled(e.kind) then
+            i = i + 1
+        else
+            pcall(releaseEntry, e)
+            local map = entryOf[e.container]
+            if map then map[e.key] = nil end
+            entries[i] = entries[#entries]
+            entries[#entries] = nil
+        end
+    end
+end
+
+local function register(e)
+    if not e then return end
+    if not known[e.tbl] then
+        gunTables[#gunTables + 1] = e
+    end
+    known[e.tbl] = e
+end
+
+local function walkTables(root, relaxed, add, limit)
+    local visited, stack, count = {}, {{root, 0}}, 0
+    while #stack > 0 do
+        local item = table.remove(stack)
+        local t, depth = item[1], item[2]
+        if not visited[t] then
+            visited[t] = true
+            count = count + 1
+            if count > limit then break end
+            add(inspectTable(t, relaxed))
+            if depth < 3 then
+                pcall(function()
+                    for _, v in next, t do
+                        if type(v) == "table" and not visited[v] then
+                            stack[#stack + 1] = {v, depth + 1}
+                        end
+                    end
+                end)
+            end
+        end
+    end
+end
+
+local function hintRoots()
+    local roots, seenInst = {}, {}
+    local function take(inst)
+        if seenInst[inst] or not inst:IsA("ModuleScript") then return end
+        seenInst[inst] = true
+        local ok, mod = pcall(require, inst)
+        if ok and type(mod) == "table" then
+            roots[#roots + 1] = {name = inst.Name, mod = mod}
+        end
+    end
+    pcall(function()
+        if type(getloadedmodules) == "function" then
+            for _, inst in ipairs(getloadedmodules()) do
+                if HINT_NAMES[inst.Name] then take(inst) end
+            end
+        end
+    end)
+    pcall(function()
+        local places = {cref(game:GetService("ReplicatedStorage")), LocalPlayer:FindFirstChild("PlayerScripts")}
+        for _, place in ipairs(places) do
+            for name in pairs(HINT_NAMES) do
+                local inst = place:FindFirstChild(name, true)
+                if inst then take(inst) end
+            end
+        end
+    end)
+    return roots
+end
+
+local function hintScan()
+    for _, r in ipairs(hintRoots()) do
+        walkTables(r.mod, true, register, 3000)
+    end
+end
+
+local function fastScan(add)
+    if type(filtergc) ~= "function" then return end
+    for _, k in ipairs(FAST_KEYS) do
+        local ok, res = pcall(filtergc, "table", {Keys = {k}}, false)
+        if ok and type(res) == "table" then
+            for _, t in ipairs(res) do
+                if type(t) == "table" then add(inspectTable(t, false)) end
+            end
+        end
+    end
+end
+
+local function requestScan()
+    scanRequested = true
+end
+
+local function runScan()
+    if scanning then
+        scanAgain = true
+        return
+    end
+    scanning = true
+    local seenNow = {}
+    local function add(e)
+        if not e or seenNow[e.tbl] then return end
+        seenNow[e.tbl] = e
+        register(e)
+    end
+    pcall(function()
+        for _, r in ipairs(hintRoots()) do
+            walkTables(r.mod, true, add, 3000)
+        end
+        fastScan(add)
+        if type(getgc) == "function" then
+            local okGc, objs = pcall(getgc, true)
+            if okGc and type(objs) == "table" then
+                local n = 0
+                for _, obj in ipairs(objs) do
+                    n = n + 1
+                    if n % 3000 == 0 then task.wait() end
+                    if type(obj) == "table" then add(inspectTable(obj, false)) end
+                end
+            end
+        end
+    end)
+    local list, kn = {}, {}
+    for t, e in pairs(seenNow) do
+        list[#list + 1] = e
+        kn[t] = e
+    end
+    gunTables, known = list, kn
+    scanning = false
+    if scanAgain then
+        scanAgain = false
+        scanRequested = true
+    end
+    if notifyNext then
+        notifyNext = false
+        pcall(function()
+            lib:Notification("Gun Mods", string.format("Scan done: %d weapon tables found", #gunTables))
+        end)
+    end
+end
+
+local function trackable(name)
+    local kind = classify(name)
+    return kind ~= nil and kind ~= "capacity"
+end
 
 local function clearTool()
     for _, c in ipairs(toolConns) do pcall(function() c:Disconnect() end) end
@@ -581,25 +837,36 @@ local function clearTool()
     table.clear(toolTargets)
 end
 
-local function liveKind(name)
-    local kind = classify(name)
-    if kind ~= "ammo" then return kind end
-    return nil
+local function applyTarget(container, key, mode, cap)
+    local map = entryOf[container]
+    local e = map and map[key]
+    if e then
+        enforce(e)
+        return
+    end
+    local cur
+    if mode == "table" then
+        cur = rawget(container, key)
+    elseif mode == "value" then
+        cur = container.Value
+    else
+        cur = container:GetAttribute(key)
+    end
+    if cur ~= nil then ensureEntry(container, key, cur, mode, cap) end
 end
 
 local function trackInstance(inst)
-    if (inst:IsA("IntValue") or inst:IsA("NumberValue")) and liveKind(inst.Name) then
+    if (inst:IsA("IntValue") or inst:IsA("NumberValue")) and trackable(inst.Name) then
         toolTargets[#toolTargets + 1] = {inst = inst, key = inst.Name, mode = "value"}
         toolConns[#toolConns + 1] = inst:GetPropertyChangedSignal("Value"):Connect(function()
-            if anyGunMod() then pcall(applyValue, inst, inst.Name, inst.Value, "value") end
+            if anyGunMod() then pcall(applyTarget, inst, inst.Name, "value") end
         end)
     end
     for name, val in pairs(inst:GetAttributes()) do
-        if type(val) == "number" and liveKind(name) then
+        if type(val) == "number" and trackable(name) then
             toolTargets[#toolTargets + 1] = {inst = inst, key = name, mode = "attr"}
             toolConns[#toolConns + 1] = inst:GetAttributeChangedSignal(name):Connect(function()
-                local cur = inst:GetAttribute(name)
-                if type(cur) == "number" and anyGunMod() then pcall(applyValue, inst, name, cur, "attr") end
+                if anyGunMod() then pcall(applyTarget, inst, name, "attr") end
             end)
         end
     end
@@ -620,49 +887,12 @@ end
 local function applyAll()
     if not anyGunMod() then return end
     for _, tgt in ipairs(toolTargets) do
-        local inst = tgt.inst
-        if inst.Parent then
-            local cur
-            if tgt.mode == "value" then cur = inst.Value else cur = inst:GetAttribute(tgt.key) end
-            if type(cur) == "number" then applyValue(inst, tgt.key, cur, tgt.mode) end
-        end
+        if tgt.inst.Parent then applyTarget(tgt.inst, tgt.key, tgt.mode) end
     end
-    for _, entry in ipairs(gunTables) do
-        local t = entry.tbl
-        for _, k in ipairs(entry.keys) do
-            local v = rawget(t, k)
-            if v ~= nil and classify(k) ~= "ammo" then applyValue(t, k, v, "table") end
+    for _, item in ipairs(gunTables) do
+        for _, k in ipairs(item.keys) do
+            applyTarget(item.tbl, k, "table", item.cap)
         end
-    end
-end
-
-local function applyAmmoOld()
-    if not Settings.InfAmo then return end
-    for _, entry in ipairs(gunTables) do
-        pcall(function()
-            for k, v in next, entry.tbl do
-                if type(k) == "string" and type(v) == "number" and classify(k) == "ammo" then
-                    applyValue(entry.tbl, k, v, "table")
-                end
-            end
-        end)
-    end
-    local char = LocalPlayer.Character
-    local tool = char and char:FindFirstChildOfClass("Tool")
-    if not tool then return end
-    local function attrs(inst)
-        for name, val in pairs(inst:GetAttributes()) do
-            if type(val) == "number" and classify(name) == "ammo" then
-                applyValue(inst, name, val, "attr")
-            end
-        end
-    end
-    attrs(tool)
-    for _, inst in ipairs(tool:GetDescendants()) do
-        if inst:IsA("ValueBase") and type(inst.Value) == "number" and classify(inst.Name) == "ammo" then
-            applyValue(inst, inst.Name, inst.Value, "value")
-        end
-        attrs(inst)
     end
 end
 
@@ -673,7 +903,10 @@ local function onCharacter(char)
     connect(char.ChildAdded, function(c)
         if c:IsA("Tool") then
             refreshTool()
-            requestScan()
+            if anyGunMod() then
+                pcall(hintScan)
+                requestScan()
+            end
         end
     end)
     connect(char.ChildRemoved, function(c)
@@ -685,21 +918,81 @@ end
 if LocalPlayer.Character then onCharacter(LocalPlayer.Character) end
 connect(LocalPlayer.CharacterAdded, function(char)
     onCharacter(char)
-    requestScan()
+    if anyGunMod() then requestScan() end
 end)
 
 task.spawn(function()
     while alive do
-        if anyGunMod() and (scanRequested or os.clock() - lastScan > 3) then
+        pcall(restoreDisabled)
+        if anyGunMod() and not scanning and (scanRequested or os.clock() - lastScan > 15) then
             scanRequested = false
             lastScan = os.clock()
-            pcall(scanGC)
+            pcall(runScan)
         end
-        pcall(restoreDisabled)
-        pcall(applyAmmoOld)
-        task.wait(0.1)
+        task.wait(0.25)
     end
 end)
+
+local function onGunToggle(on)
+    if on then
+        notifyNext = true
+        pcall(hintScan)
+        requestScan()
+    else
+        pcall(restoreDisabled)
+    end
+end
+
+local function dumpGunData()
+    local lines = {}
+    local function add(s) lines[#lines + 1] = s end
+    add("Defusal Menu gun data")
+    add("PlaceId " .. tostring(game.PlaceId))
+    for _, r in ipairs(hintRoots()) do
+        add("module " .. r.name)
+        local n = 0
+        for k, v in next, r.mod do
+            n = n + 1
+            if n > 80 then
+                add("  ...")
+                break
+            end
+            local tv = typeof(v)
+            local shown = ""
+            if tv == "number" or tv == "boolean" or tv == "string" then shown = " = " .. tostring(v) end
+            add("  " .. tostring(k) .. " : " .. tv .. shown)
+        end
+    end
+    for i, item in ipairs(gunTables) do
+        add(string.format("table %d cap=%s", i, tostring(item.cap)))
+        local map = entryOf[item.tbl]
+        for _, k in ipairs(item.keys) do
+            local e = map and map[k]
+            local shown
+            if e and e.frozen then
+                shown = "frozen " .. tostring(e.target) .. " (was " .. tostring(e.orig) .. ")"
+            else
+                shown = tostring(rawget(item.tbl, k))
+            end
+            add(string.format("  %s [%s] = %s", k, tostring(classify(k)), shown))
+        end
+    end
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then
+        add("tool " .. tool:GetFullName())
+        local n = 0
+        for _, d in ipairs(tool:GetDescendants()) do
+            n = n + 1
+            if n > 60 then
+                add("  ...")
+                break
+            end
+            add("  " .. d.ClassName .. " " .. d.Name)
+        end
+    end
+    return table.concat(lines, "\n")
+end
 
 local THEME = "Black"
 local function accentFor(theme)
@@ -740,15 +1033,40 @@ local gunTab = win:Tab("Gun", "wrench")
 gunTab:Section("Weapon")
 gunTab:Toggle("No Recoil", Settings.NoRec, function(t)
     Settings.NoRec = t
-    requestScan()
+    onGunToggle(t)
+end)
+gunTab:Toggle("No Spread", Settings.NoSpread, function(t)
+    Settings.NoSpread = t
+    onGunToggle(t)
 end)
 gunTab:Toggle("Infinite Ammo", Settings.InfAmo, function(t)
     Settings.InfAmo = t
-    requestScan()
+    onGunToggle(t)
 end)
 gunTab:Toggle("Fire Rate", Settings.RapidFire, function(t)
     Settings.RapidFire = t
-    requestScan()
+    onGunToggle(t)
+end)
+gunTab:Section("Debug")
+gunTab:Button("Copy Gun Data", function()
+    task.spawn(function()
+        if #gunTables == 0 then pcall(runScan) end
+        local t0 = os.clock()
+        while scanning and os.clock() - t0 < 30 do task.wait(0.1) end
+        local text = dumpGunData()
+        local copied = false
+        if type(setclipboard) == "function" then copied = pcall(setclipboard, text) end
+        local saved = false
+        if type(writefile) == "function" then saved = pcall(writefile, "DefusalMenu_gundata.txt", text) end
+        if not copied and not saved then print(text) end
+        local msg = "Printed to the console"
+        if copied then
+            msg = "Copied to clipboard"
+        elseif saved then
+            msg = "Saved to DefusalMenu_gundata.txt"
+        end
+        lib:Notification("Gun Data", msg)
+    end)
 end)
 
 local setTab = win:Tab("Settings", "settings")
@@ -765,7 +1083,7 @@ setTab:Section("Danger Zone")
 local function destroy()
     alive = false
     pcall(function() RunService:UnbindFromRenderStep(LOCK_NAME) end)
-    Settings.NoRec, Settings.InfAmo, Settings.RapidFire = false, false, false
+    Settings.NoRec, Settings.NoSpread, Settings.InfAmo, Settings.RapidFire = false, false, false, false
     pcall(restoreDisabled)
     clearTool()
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
