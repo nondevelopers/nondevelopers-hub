@@ -1,4 +1,4 @@
-- loadstring  
+**loadstring**  
 ```luau
 loadstring(game:HttpGet("https://raw.githubusercontent.com/nondevelopers/nondevelopers-hub/main/loader.luau"))()
 ```
