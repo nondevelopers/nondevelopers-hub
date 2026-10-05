@@ -17,6 +17,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
+local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
 
@@ -52,6 +53,10 @@ local config = {
     BuyDelay = 5,
     BuyBetweenWaves = true,
     AutoSave = true,
+    MatchRate = true,
+    RateScale = 100,
+    AutoFireMethod = "Gun Remote",
+    AutoFire = false,
     ESP = false,
     AutoBuy = false,
     AutoPowerups = false,
@@ -60,7 +65,7 @@ local config = {
 local persistedKeys = {
     "AutoEquip", "PreferredTool", "AntiAFK", "BossPriority", "WaveAware", "MultiTarget",
     "MaxTargets", "SafeEnabled", "SafeBelow", "SafeResume", "ESPDistance", "PowerupName",
-    "BuyCalls", "BuyDelay", "BuyBetweenWaves", "AutoSave",
+    "BuyCalls", "BuyDelay", "BuyBetweenWaves", "AutoSave", "MatchRate", "RateScale", "AutoFireMethod",
 }
 local persistedGlobals = {"GroundDistance", "BehindDistance", "FireDelay"}
 
@@ -159,6 +164,8 @@ end
 local tracked = {}
 local kills = 0
 local shots = 0
+local lastDamageAt = 0
+local stall = {noTarget = 0, retreat = 0, noTool = 0, noGun = 0, silent = 0}
 local credited = setmetatable({}, {__mode = "k"})
 local lastFired = setmetatable({}, {__mode = "k"})
 
@@ -210,7 +217,12 @@ local function track(model, isBoss)
         if not hum or tracked[model] ~= info then
             return
         end
+        info.hp = hum.Health
         info.conns[#info.conns + 1] = hum.HealthChanged:Connect(function(h)
+            if info.hp and h < info.hp then
+                lastDamageAt = os.clock()
+            end
+            info.hp = h
             if h <= 0 then
                 credit(model)
             end
@@ -303,6 +315,88 @@ local function rankedTargets(fromPos, skip)
         return a.d < b.d
     end)
     return list
+end
+
+local function normalizeName(s)
+    return (tostring(s):lower():gsub("[^%w]", ""))
+end
+
+local RATE_LIST = {
+    {"Pistol", 6}, {"Revolver", 4}, {"Uzi", 10}, {"Trench Shotgun", 2.5}, {"M1 Garand", 3},
+    {"Type 100", 6}, {"M16", 8}, {"Sniper", 1.5}, {"Tactical Shotgun", 3}, {"Thompson", 12},
+    {"Blaster", 3.5}, {"Machine Gun", 16}, {"Cobra", 1.5}, {"Fiery Cannon", 2.5}, {"Toxic", 10},
+    {"Retribution Ray", 6}, {"Platinum Gun", 4}, {"Scope Rifle", 2.5}, {"Space Gun", 8}, {"Railgun", 1},
+    {"Ghost", 10}, {"Alien Rifle", 7}, {"Ray Gun", 6}, {"Annihilator", 18.5}, {"Biohazard", 10},
+    {"Venom", 1}, {"Golden Pistol", 6}, {"Rainbow Blaster", 15}, {"Hex Spitter", 8}, {"Beam Launcher", 1.5},
+    {"Gatling Laser", 20}, {"Tri Laser", 3.5}, {"Techno Rifle", 3}, {"Minigun", 22},
+}
+
+local FIRE_RATES = {}
+for _, e in ipairs(RATE_LIST) do
+    FIRE_RATES[normalizeName(e[1])] = e[2]
+end
+
+local function rateFor(name)
+    local key = normalizeName(name)
+    local exact = FIRE_RATES[key]
+    if exact then
+        return exact
+    end
+    local found, bestLen = nil, 0
+    for k, v in pairs(FIRE_RATES) do
+        if key:find(k, 1, true) and #k > bestLen then
+            found, bestLen = v, #k
+        end
+    end
+    return found
+end
+
+local function shotDelay(tool)
+    if config.MatchRate then
+        local r = rateFor(tool.Name)
+        if r then
+            return (1 / r) / (config.RateScale / 100), true
+        end
+    end
+    return getgenv().FireDelay, false
+end
+
+local function diagnostics()
+    local char = player.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    local delay, matched = getgenv().FireDelay, false
+    if tool then
+        delay, matched = shotDelay(tool)
+    end
+    return table.concat({
+        "Tool: " .. (tool and tool.Name or "none"),
+        string.format("Shot delay: %d ms (%s)", math.floor(delay * 1000 + 0.5), matched and "matched to weapon rate" or "slider value"),
+        "Multi-target: " .. tostring(config.MultiTarget) .. " x" .. config.MaxTargets,
+        "Boss priority: " .. tostring(config.BossPriority) .. " | Wave aware: " .. tostring(config.WaveAware),
+        string.format("Stall seconds - no target %.1f | retreat %.1f | no tool %.1f | no gun remote %.1f | shots ignored by server %.1f",
+            stall.noTarget, stall.retreat, stall.noTool, stall.noGun, stall.silent),
+        "Shots: " .. shots .. " | Kills: " .. kills,
+    }, "\n")
+end
+
+local function dumpTool()
+    local char = player.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if not tool then
+        return nil
+    end
+    local out = {"Tool: " .. tool.Name}
+    for k, v in pairs(tool:GetAttributes()) do
+        out[#out + 1] = "Attribute " .. tostring(k) .. " = " .. tostring(v)
+    end
+    for _, d in ipairs(tool:GetDescendants()) do
+        local line = d.ClassName .. " " .. d:GetFullName()
+        if d:IsA("ValueBase") then
+            line = line .. " = " .. tostring(d.Value)
+        end
+        out[#out + 1] = line
+    end
+    return table.concat(out, "\n")
 end
 
 local function ensureTool()
@@ -434,26 +528,37 @@ local function farmStep()
     zeroVel(char, root)
 end
 
-local function fireStep()
+local function fireStep(dt)
     if retreating then
+        stall.retreat = stall.retreat + dt
         return
     end
     local target = getgenv().globalTarget
     if not isAlive(target) then
+        stall.noTarget = stall.noTarget + dt
         return
     end
     local now = os.clock()
-    if now - lastShot < getgenv().FireDelay then
-        return
+    if lastShot > 0 and now - lastShot < 0.5 and now - lastDamageAt > 1.5 then
+        stall.silent = stall.silent + dt
     end
     local tool = ensureTool()
+    if not tool then
+        stall.noTool = stall.noTool + dt
+        return
+    end
     local gun = ReplicatedStorage:FindFirstChild("Gun")
-    if not tool or not gun then
+    if not gun then
+        stall.noGun = stall.noGun + dt
+        return
+    end
+    local delay, matched = shotDelay(tool)
+    if now - lastShot < delay then
         return
     end
     lastShot = now
     fireAt(gun, target, tool.Name)
-    if config.MultiTarget and config.MaxTargets > 1 then
+    if config.MultiTarget and not matched and config.MaxTargets > 1 then
         local char = player.Character
         local root = char and char:FindFirstChild("HumanoidRootPart")
         if root then
@@ -492,9 +597,73 @@ local function startFarm()
     getgenv().AutoFarmEnabled = true
     runStart = os.clock()
     lastShot = 0
+    lastDamageAt = os.clock()
     renderConn = RunService.RenderStepped:Connect(farmStep)
     heartConn = RunService.Heartbeat:Connect(fireStep)
 end
+
+local holding = false
+local lastAuto = 0
+
+local function manualShot(tool)
+    if config.AutoFireMethod == "Tool Activate" then
+        tool:Activate()
+        return
+    end
+    local gun = ReplicatedStorage:FindFirstChild("Gun")
+    local mouse = player:GetMouse()
+    local hit = mouse.Target
+    if not gun or not hit then
+        return
+    end
+    local pos = mouse.Hit.Position
+    shots = shots + 1
+    gun:FireServer({
+        ["Normal"] = Vector3.new(0, 0, 0),
+        ["Direction"] = pos,
+        ["Name"] = tool.Name,
+        ["Hit"] = hit,
+        ["Origin"] = pos,
+        ["Pos"] = pos
+    })
+end
+
+local function autoFireStep()
+    if not config.AutoFire or not holding or getgenv().AutoFarmEnabled then
+        return
+    end
+    local char = player.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if not tool then
+        return
+    end
+    local now = os.clock()
+    local delay = shotDelay(tool)
+    if now - lastAuto < delay then
+        return
+    end
+    lastAuto = now
+    manualShot(tool)
+end
+
+local function isFireInput(input)
+    local t = input.UserInputType
+    return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
+end
+
+keep(UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and isFireInput(input) then
+        holding = true
+    end
+end))
+
+keep(UserInputService.InputEnded:Connect(function(input)
+    if isFireInput(input) then
+        holding = false
+    end
+end))
+
+keep(RunService.Heartbeat:Connect(autoFireStep))
 
 local waveSource = nil
 local cashValue = nil
@@ -582,6 +751,8 @@ local function statsText()
         kills = "Kills: " .. kills,
         rate = string.format("Kills/min: %.1f", rate),
         shots = "Shots: " .. shots,
+        stallA = string.format("Stalled (s): no target %.1f | no tool %.1f | no gun %.1f", stall.noTarget, stall.noTool, stall.noGun),
+        stallB = string.format("Retreat %.1f s | Shots ignored by server %.1f s", stall.retreat, stall.silent),
         cash = cashText,
         time = string.format("Runtime: %02d:%02d:%02d", math.floor(s / 3600), math.floor((s % 3600) / 60), s % 60),
     }
@@ -954,6 +1125,8 @@ local sRate = statsTab:Section("Kills/min: 0.0")
 local sShots = statsTab:Section("Shots: 0")
 local sCash = statsTab:Section("Cash: n/a")
 local sTime = statsTab:Section("Runtime: 00:00:00")
+local sStallA = statsTab:Section("Stalled (s): -")
+local sStallB = statsTab:Section("Retreat 0.0 s | Shots ignored by server 0.0 s")
 
 local function setStat(obj, text)
     pcall(function()
@@ -974,6 +1147,8 @@ local function refreshStats()
     setStat(sShots, t.shots)
     setStat(sCash, t.cash)
     setStat(sTime, t.time)
+    setStat(sStallA, t.stallA)
+    setStat(sStallB, t.stallB)
 end
 
 statsTab:Button("Show Stats", function()
@@ -985,6 +1160,9 @@ statsTab:Button("Reset Stats", function()
     kills = 0
     shots = 0
     cleared = 0
+    for k in pairs(stall) do
+        stall[k] = 0
+    end
     runAccum = 0
     if runStart then
         runStart = os.clock()
@@ -1076,6 +1254,38 @@ end)
 
 farmTab:Slider("Fire Delay (ms)", 20, 200, math.clamp(math.floor(getgenv().FireDelay * 1000 + 0.5), 20, 200), function(v)
     getgenv().FireDelay = v / 1000
+end)
+
+farmTab:Section("Weapons")
+
+farmTab:Toggle("Match Weapon Fire Rate", config.MatchRate, function(state)
+    config.MatchRate = state
+end)
+
+farmTab:Slider("Fire Rate Scale (%)", 50, 200, math.clamp(config.RateScale, 50, 200), function(v)
+    config.RateScale = v
+end)
+
+farmTab:Toggle("Auto Fire (hold click = every gun automatic)", false, function(state)
+    config.AutoFire = state
+    holding = false
+end)
+
+farmTab:Dropdown("Auto Fire Method", {"Gun Remote", "Tool Activate"}, function(t)
+    config.AutoFireMethod = t
+end)
+
+farmTab:Button("Copy Diagnostics", function()
+    notify("Diagnostics", copyText(diagnostics()) and "Copied to clipboard." or "No clipboard access.", 4)
+end)
+
+farmTab:Button("Copy Equipped Tool Info", function()
+    local text = dumpTool()
+    if not text then
+        notify("Tool Info", "Equip a weapon first.", 3)
+        return
+    end
+    notify("Tool Info", copyText(text) and "Copied to clipboard." or "No clipboard access.", 4)
 end)
 
 itemsTab:Section("Powerups")
@@ -1225,7 +1435,7 @@ end)
 miscTab:Section("Info")
 miscTab:Label("created by: @nondevelopers")
 miscTab:Label("Discord: nonfq")
-miscTab:Label("Version: v3")
+miscTab:Label("Version: v3.1")
 
 settingsTab:Section("Appearance")
 
