@@ -1,3 +1,7 @@
+if getgenv().ZA_Shutdown then
+    pcall(getgenv().ZA_Shutdown)
+end
+
 getgenv().AutoFarmEnabled = false
 getgenv().GroundDistance = 8
 getgenv().BehindDistance = 9
@@ -12,19 +16,29 @@ local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
 local player = Players.LocalPlayer
-local enemies = Workspace.enemies
-local bossFolder = Workspace.BossFolder
-local allFolders = {bossFolder, enemies}
 
 local THEME = "Dark"
 local CONFIG_FILE = "ZombieAttackFarm_config.json"
+local ENEMY_FOLDER = "enemies"
+local BOSS_FOLDER = "BossFolder"
+local ESP_HIGHLIGHT_MAX = 24
+local LOG_MAX = 80
+
+local alive = true
+local conns = {}
+
+local function keep(c)
+    conns[#conns + 1] = c
+    return c
+end
 
 local config = {
     AutoEquip = true,
+    PreferredTool = "",
     AntiAFK = true,
-    ESP = false,
     BossPriority = false,
     WaveAware = true,
     MultiTarget = true,
@@ -32,16 +46,21 @@ local config = {
     SafeEnabled = false,
     SafeBelow = 30,
     SafeResume = 80,
-    AutoBuy = false,
-    BuyBetweenWaves = true,
-    BuyRemote = "",
-    BuyArgs = "",
+    ESPDistance = true,
+    PowerupName = "",
+    BuyCalls = "",
     BuyDelay = 5,
+    BuyBetweenWaves = true,
+    AutoSave = true,
+    ESP = false,
+    AutoBuy = false,
+    AutoPowerups = false,
 }
 
 local persistedKeys = {
-    "AutoEquip", "AntiAFK", "BossPriority", "WaveAware", "MultiTarget", "MaxTargets",
-    "SafeEnabled", "SafeBelow", "SafeResume", "BuyBetweenWaves", "BuyRemote", "BuyArgs", "BuyDelay",
+    "AutoEquip", "PreferredTool", "AntiAFK", "BossPriority", "WaveAware", "MultiTarget",
+    "MaxTargets", "SafeEnabled", "SafeBelow", "SafeResume", "ESPDistance", "PowerupName",
+    "BuyCalls", "BuyDelay", "BuyBetweenWaves", "AutoSave",
 }
 local persistedGlobals = {"GroundDistance", "BehindDistance", "FireDelay"}
 
@@ -105,10 +124,43 @@ local win = lib:Window(
 )
 
 local farmTab = win:Tab("Autofarm", "crosshair")
+local itemsTab = win:Tab("Items", "package")
 local statsTab = win:Tab("Stats", "activity")
 local visualTab = win:Tab("Visuals", "eye")
 local miscTab = win:Tab("Misc", "settings")
 local settingsTab = win:Tab("Settings", "sliders-horizontal")
+
+local function notify(title, text, duration)
+    pcall(function()
+        lib:Notification(title, text, duration or 4)
+    end)
+end
+
+local function trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function copyText(text)
+    if typeof(setclipboard) == "function" then
+        pcall(setclipboard, text)
+        return true
+    end
+    return false
+end
+
+local function fmtNum(n)
+    local neg = n < 0
+    local s = tostring(math.floor(math.abs(n) + 0.5))
+    s = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    s = s:gsub("^,", "")
+    return (neg and "-" or "") .. s
+end
+
+local tracked = {}
+local kills = 0
+local shots = 0
+local credited = setmetatable({}, {__mode = "k"})
+local lastFired = setmetatable({}, {__mode = "k"})
 
 local function isAlive(model)
     if not model or not model.Parent then
@@ -121,20 +173,127 @@ local function isAlive(model)
         and model:FindFirstChild("HumanoidRootPart") ~= nil
 end
 
-local function collect()
-    local list = {}
-    local char = player.Character
-    local head = char and char:FindFirstChild("Head")
-    if not head then
-        return list
+local function credit(model)
+    if credited[model] then
+        return
     end
-    local myPos = head.Position
-    for _, folder in ipairs(allFolders) do
-        local isBoss = folder == bossFolder
-        for _, v in ipairs(folder:GetChildren()) do
-            if isAlive(v) then
-                list[#list + 1] = {m = v, d = (myPos - v.Head.Position).Magnitude, boss = isBoss}
+    local t = lastFired[model]
+    if not t or os.clock() - t > 4 then
+        return
+    end
+    credited[model] = true
+    kills = kills + 1
+end
+
+local function untrack(model)
+    local info = tracked[model]
+    if not info then
+        return
+    end
+    credit(model)
+    for _, c in ipairs(info.conns) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    tracked[model] = nil
+end
+
+local function track(model, isBoss)
+    if tracked[model] then
+        return
+    end
+    local info = {boss = isBoss, conns = {}}
+    tracked[model] = info
+    task.spawn(function()
+        local hum = model:WaitForChild("Humanoid", 5)
+        if not hum or tracked[model] ~= info then
+            return
+        end
+        info.conns[#info.conns + 1] = hum.HealthChanged:Connect(function(h)
+            if h <= 0 then
+                credit(model)
             end
+        end)
+        info.conns[#info.conns + 1] = hum.Died:Connect(function()
+            credit(model)
+        end)
+    end)
+end
+
+local folderStates = {}
+
+local function bindFolder(name, isBoss)
+    local state = {name = name, folder = nil, conns = {}}
+    local function attach(folder)
+        for _, c in ipairs(state.conns) do
+            pcall(function()
+                c:Disconnect()
+            end)
+        end
+        state.conns = {}
+        state.folder = folder
+        if not folder then
+            return
+        end
+        for _, m in ipairs(folder:GetChildren()) do
+            if m:IsA("Model") then
+                track(m, isBoss)
+            end
+        end
+        state.conns[#state.conns + 1] = folder.ChildAdded:Connect(function(m)
+            if m:IsA("Model") then
+                track(m, isBoss)
+            end
+        end)
+        state.conns[#state.conns + 1] = folder.ChildRemoved:Connect(function(m)
+            untrack(m)
+        end)
+    end
+    state.attach = attach
+    attach(Workspace:FindFirstChild(name))
+    folderStates[#folderStates + 1] = state
+end
+
+bindFolder(BOSS_FOLDER, true)
+bindFolder(ENEMY_FOLDER, false)
+
+local function aliveCount()
+    local n = 0
+    for m in pairs(tracked) do
+        if isAlive(m) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function nearest(fromPos)
+    local best, bestD, bestBoss = nil, math.huge, false
+    for m, info in pairs(tracked) do
+        if isAlive(m) then
+            local d = (fromPos - m.HumanoidRootPart.Position).Magnitude
+            local better
+            if not best then
+                better = true
+            elseif config.BossPriority and info.boss ~= bestBoss then
+                better = info.boss
+            else
+                better = d < bestD
+            end
+            if better then
+                best, bestD, bestBoss = m, d, info.boss
+            end
+        end
+    end
+    return best
+end
+
+local function rankedTargets(fromPos, skip)
+    local list = {}
+    for m, info in pairs(tracked) do
+        if m ~= skip and isAlive(m) then
+            list[#list + 1] = {m = m, d = (fromPos - m.HumanoidRootPart.Position).Magnitude, boss = info.boss}
         end
     end
     table.sort(list, function(a, b)
@@ -151,76 +310,59 @@ local function ensureTool()
     if not char then
         return nil
     end
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool then
-        return tool
+    local equipped = char:FindFirstChildOfClass("Tool")
+    local want = config.PreferredTool
+    if equipped and (want == "" or equipped.Name == want) then
+        return equipped
     end
     if config.AutoEquip then
         local hum = char:FindFirstChildOfClass("Humanoid")
-        local backpack = player:FindFirstChildOfClass("Backpack")
-        local candidate = backpack and backpack:FindFirstChildOfClass("Tool")
-        if hum and candidate then
-            hum:EquipTool(candidate)
-            return candidate
-        end
-    end
-    return nil
-end
-
-local kills = 0
-local shots = 0
-local credited = setmetatable({}, {__mode = "k"})
-local watched = setmetatable({}, {__mode = "k"})
-local lastFired = setmetatable({}, {__mode = "k"})
-
-local function credit(model)
-    if credited[model] then
-        return
-    end
-    credited[model] = true
-    kills += 1
-end
-
-local function watch(model)
-    if watched[model] then
-        return
-    end
-    watched[model] = true
-    local hum = model:FindFirstChild("Humanoid")
-    if hum then
-        hum.HealthChanged:Connect(function(h)
-            if h <= 0 then
-                credit(model)
+        local bp = player:FindFirstChildOfClass("Backpack")
+        if hum and bp then
+            local cand
+            if want ~= "" then
+                cand = bp:FindFirstChild(want)
             end
-        end)
-        hum.Died:Connect(function()
-            credit(model)
-        end)
-    end
-    model.AncestryChanged:Connect(function(_, parent)
-        if not parent and os.clock() - (lastFired[model] or 0) < 2 then
-            credit(model)
+            if not cand and not equipped then
+                cand = bp:FindFirstChildOfClass("Tool")
+            end
+            if cand and cand:IsA("Tool") then
+                hum:EquipTool(cand)
+                return cand
+            end
         end
-    end)
+    end
+    return equipped
 end
 
-local connection
+local function fireAt(gun, model, toolName)
+    local head = model:FindFirstChild("Head")
+    if not head then
+        return
+    end
+    lastFired[model] = os.clock()
+    shots = shots + 1
+    gun:FireServer({
+        ["Normal"] = Vector3.new(0, 0, 0),
+        ["Direction"] = head.Position,
+        ["Name"] = toolName,
+        ["Hit"] = head,
+        ["Origin"] = head.Position,
+        ["Pos"] = head.Position
+    })
+end
+
+local renderConn, heartConn
 local retreating = false
-local isIdle = true
-local safePos
-local farmSession = 0
+local safePos = nil
+local safeCustom = false
+local forced = nil
+local lastShot = 0
 local runAccum = 0
-local runStart
+local runStart = nil
 
 local function elapsed()
     return runAccum + (runStart and (os.clock() - runStart) or 0)
-end
-
-local function getSafePos(root)
-    if not safePos then
-        safePos = root.Position + Vector3.new(0, 150, 0)
-    end
-    return safePos
 end
 
 local function zeroVel(char, root)
@@ -232,49 +374,20 @@ local function zeroVel(char, root)
     end
 end
 
-local function stopFarm()
-    if runStart then
-        runAccum += os.clock() - runStart
-        runStart = nil
-    end
-    getgenv().AutoFarmEnabled = false
-    if connection then
-        connection:Disconnect()
-        connection = nil
-    end
-    getgenv().globalTarget = nil
-    retreating = false
-    isIdle = true
-    farmSession += 1
-end
-
-local function fireAt(model, toolName)
-    local head = model:FindFirstChild("Head")
-    if not head then
-        return
-    end
-    watch(model)
-    lastFired[model] = os.clock()
-    shots += 1
-    ReplicatedStorage.Gun:FireServer({
-        ["Normal"] = Vector3.new(0, 0, 0),
-        ["Direction"] = head.Position,
-        ["Name"] = toolName,
-        ["Hit"] = head,
-        ["Origin"] = head.Position,
-        ["Pos"] = head.Position
-    })
-end
-
-local function step()
+local function farmStep()
     local char = player.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then
+        getgenv().globalTarget = nil
         return
     end
-    local hum = char:FindFirstChildOfClass("Humanoid")
 
-    if config.SafeEnabled and hum and hum.MaxHealth > 0 then
+    if not safePos then
+        safePos = root.Position + Vector3.new(0, 120, 0)
+    end
+
+    if config.SafeEnabled and hum.MaxHealth > 0 then
         local pct = hum.Health / hum.MaxHealth * 100
         local resume = math.max(config.SafeResume, config.SafeBelow + 5)
         if pct < config.SafeBelow then
@@ -287,33 +400,41 @@ local function step()
     end
 
     if retreating then
-        root.CFrame = CFrame.new(getSafePos(root))
+        getgenv().globalTarget = nil
+        root.CFrame = CFrame.new(safePos)
         zeroVel(char, root)
         return
     end
 
-    local list = collect()
-    local target = list[1] and list[1].m or nil
+    if forced then
+        if os.clock() < forced.untilT then
+            root.CFrame = forced.cf
+            zeroVel(char, root)
+            return
+        end
+        forced = nil
+    end
+
+    local target = nearest(root.Position)
     getgenv().globalTarget = target
 
     if not target then
-        isIdle = true
         if config.WaveAware then
-            root.CFrame = CFrame.new(getSafePos(root))
+            root.CFrame = CFrame.new(safePos)
             zeroVel(char, root)
         end
         return
     end
 
-    isIdle = false
-
     local cam = Workspace.CurrentCamera
-    cam.CFrame = CFrame.new(cam.CFrame.Position, target.Head.Position)
+    if cam then
+        cam.CFrame = CFrame.new(cam.CFrame.Position, target.Head.Position)
+    end
     root.CFrame = target.HumanoidRootPart.CFrame * CFrame.new(0, getgenv().GroundDistance, getgenv().BehindDistance)
     zeroVel(char, root)
 end
 
-local function volley()
+local function fireStep()
     if retreating then
         return
     end
@@ -321,43 +442,567 @@ local function volley()
     if not isAlive(target) then
         return
     end
-    local tool = ensureTool()
-    if not tool then
+    local now = os.clock()
+    if now - lastShot < getgenv().FireDelay then
         return
     end
-    fireAt(target, tool.Name)
-    if config.MultiTarget then
-        local fired = 1
-        for _, entry in ipairs(collect()) do
-            if fired >= config.MaxTargets then
-                break
-            end
-            if entry.m ~= target and isAlive(entry.m) then
-                fireAt(entry.m, tool.Name)
-                fired += 1
+    local tool = ensureTool()
+    local gun = ReplicatedStorage:FindFirstChild("Gun")
+    if not tool or not gun then
+        return
+    end
+    lastShot = now
+    fireAt(gun, target, tool.Name)
+    if config.MultiTarget and config.MaxTargets > 1 then
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root then
+            local list = rankedTargets(root.Position, target)
+            for i = 1, math.min(#list, config.MaxTargets - 1) do
+                fireAt(gun, list[i].m, tool.Name)
             end
         end
     end
 end
 
-farmTab:Section("Lock & Kill")
+local function stopFarm()
+    if runStart then
+        runAccum = runAccum + (os.clock() - runStart)
+        runStart = nil
+    end
+    getgenv().AutoFarmEnabled = false
+    if renderConn then
+        renderConn:Disconnect()
+        renderConn = nil
+    end
+    if heartConn then
+        heartConn:Disconnect()
+        heartConn = nil
+    end
+    getgenv().globalTarget = nil
+    retreating = false
+    forced = nil
+end
 
-farmTab:Toggle("AutoFarm Lock (Spam Kill)", false, function(state)
+local function startFarm()
     stopFarm()
-    if not state then
-        return
+    if not safeCustom then
+        safePos = nil
     end
     getgenv().AutoFarmEnabled = true
     runStart = os.clock()
-    connection = RunService.RenderStepped:Connect(step)
+    lastShot = 0
+    renderConn = RunService.RenderStepped:Connect(farmStep)
+    heartConn = RunService.Heartbeat:Connect(fireStep)
+end
 
-    local current = farmSession
-    task.spawn(function()
-        while getgenv().AutoFarmEnabled and farmSession == current do
-            volley()
-            task.wait(getgenv().FireDelay)
+local waveSource = nil
+local cashValue = nil
+local cashStart = 0
+local cleared = 0
+local idleNow = true
+
+local function parseWave(text)
+    local n = tostring(text):lower():match("^%s*wave%s*[:#]?%s*(%d+)")
+    return n and tonumber(n) or nil
+end
+
+local function readWave()
+    if waveSource and waveSource.Parent then
+        local ok, v = pcall(function()
+            if waveSource:IsA("TextLabel") or waveSource:IsA("TextButton") then
+                return parseWave(waveSource.Text)
+            end
+            return tonumber(waveSource.Value)
+        end)
+        if ok and v then
+            return v
+        end
+    end
+    waveSource = nil
+    return nil
+end
+
+local function scanWave()
+    local gui = player:FindFirstChild("PlayerGui")
+    if gui then
+        for _, d in ipairs(gui:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and parseWave(d.Text) then
+                waveSource = d
+                return
+            end
+        end
+    end
+    local function isWaveValue(d)
+        return (d:IsA("IntValue") or d:IsA("NumberValue")) and d.Name:lower():find("wave", 1, true) ~= nil
+    end
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if isWaveValue(d) then
+            waveSource = d
+            return
+        end
+    end
+    for _, d in ipairs(Workspace:GetChildren()) do
+        if isWaveValue(d) then
+            waveSource = d
+            return
+        end
+    end
+end
+
+local function findCash()
+    local ls = player:FindFirstChild("leaderstats")
+    if not ls then
+        return nil
+    end
+    for _, v in ipairs(ls:GetChildren()) do
+        local n = v.Name:lower()
+        if (v:IsA("IntValue") or v:IsA("NumberValue"))
+            and (n:find("cash", 1, true) or n:find("money", 1, true) or n:find("coin", 1, true)
+                or n:find("point", 1, true) or n:find("gold", 1, true)) then
+            return v
+        end
+    end
+    return nil
+end
+
+local function statsText()
+    local e = elapsed()
+    local s = math.floor(e)
+    local rate = e > 0 and kills / (e / 60) or 0
+    local w = readWave()
+    local cashText = "Cash: n/a"
+    if cashValue and cashValue.Parent then
+        local net = cashValue.Value - cashStart
+        cashText = string.format("Cash: %s | Net: %s%s", fmtNum(cashValue.Value), net >= 0 and "+" or "", fmtNum(net))
+    end
+    return {
+        wave = w and ("Wave: " .. w) or ("Waves cleared (est.): " .. cleared),
+        alive = "Zombies alive: " .. aliveCount(),
+        kills = "Kills: " .. kills,
+        rate = string.format("Kills/min: %.1f", rate),
+        shots = "Shots: " .. shots,
+        cash = cashText,
+        time = string.format("Runtime: %02d:%02d:%02d", math.floor(s / 3600), math.floor((s % 3600) / 60), s % 60),
+    }
+end
+
+local function powerupContainers()
+    local list = {}
+    if config.PowerupName ~= "" then
+        local f = Workspace:FindFirstChild(config.PowerupName, true)
+        if f then
+            list[1] = f
+        end
+        return list
+    end
+    for _, c in ipairs(Workspace:GetChildren()) do
+        local n = c.Name:lower()
+        if n:find("powerup", 1, true) or n:find("power_up", 1, true) or n:find("pickup", 1, true) or n:find("drop", 1, true) then
+            list[#list + 1] = c
+        end
+    end
+    return list
+end
+
+local function touchParts(container)
+    local parts = {}
+    local function consider(p)
+        if p:IsA("BasePart") and (p:FindFirstChild("TouchInterest") or p:FindFirstChildWhichIsA("TouchTransmitter")) then
+            parts[#parts + 1] = p
+        end
+    end
+    consider(container)
+    for _, d in ipairs(container:GetDescendants()) do
+        consider(d)
+    end
+    return parts
+end
+
+local function touch(root, part)
+    if typeof(firetouchinterest) == "function" then
+        pcall(firetouchinterest, root, part, 0)
+        pcall(firetouchinterest, root, part, 1)
+        return true
+    end
+    local cf = part.CFrame + Vector3.new(0, 2, 0)
+    if renderConn then
+        forced = {cf = cf, untilT = os.clock() + 0.3}
+    else
+        root.CFrame = cf
+    end
+    return false
+end
+
+local function collectPowerups(limit)
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return 0
+    end
+    local done = 0
+    for _, container in ipairs(powerupContainers()) do
+        for _, part in ipairs(touchParts(container)) do
+            if done >= limit then
+                return done
+            end
+            done = done + 1
+            if not touch(root, part) then
+                return done
+            end
+        end
+    end
+    return done
+end
+
+local logging = false
+local logLines = {}
+local lastCapture = nil
+
+local function record(remote, method, packed)
+    if not logging or typeof(remote) ~= "Instance" then
+        return
+    end
+    local name = remote.Name
+    if name == "Gun" then
+        return
+    end
+    local shown, clean = {}, true
+    for i = 1, packed.n do
+        local v = packed[i]
+        local t = typeof(v)
+        if t == "string" or t == "number" or t == "boolean" then
+            shown[#shown + 1] = tostring(v)
+        else
+            clean = false
+            shown[#shown + 1] = "<" .. t .. ">"
+        end
+    end
+    local line = name .. " (" .. method .. ") " .. table.concat(shown, ",")
+    if logLines[#logLines] == line then
+        return
+    end
+    logLines[#logLines + 1] = line
+    if #logLines > LOG_MAX then
+        table.remove(logLines, 1)
+    end
+    if clean then
+        lastCapture = {name = name, args = table.concat(shown, ",")}
+    end
+end
+
+getgenv().ZA_Record = function(remote, method, packed)
+    pcall(record, remote, method, packed)
+end
+
+local function installHook()
+    if getgenv().ZA_HookInstalled then
+        return true
+    end
+    if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
+        return false
+    end
+    local old
+    local wrap = typeof(newcclosure) == "function" and newcclosure or function(f)
+        return f
+    end
+    old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+        local method = getnamecallmethod()
+        if method == "FireServer" or method == "InvokeServer" then
+            local rec = getgenv().ZA_Record
+            local ours = typeof(checkcaller) == "function" and checkcaller()
+            if rec and not ours then
+                rec(self, method, table.pack(...))
+            end
+        end
+        if typeof(setnamecallmethod) == "function" then
+            setnamecallmethod(method)
+        end
+        return old(self, ...)
+    end))
+    getgenv().ZA_HookInstalled = true
+    return true
+end
+
+local function coerce(s)
+    local n = tonumber(s)
+    if n then
+        return n
+    end
+    if s == "true" then
+        return true
+    end
+    if s == "false" then
+        return false
+    end
+    return (s:gsub("^[\"'](.*)[\"']$", "%1"))
+end
+
+local function parseCalls(raw)
+    local calls = {}
+    for entry in raw:gmatch("[^;]+") do
+        local pieces = {}
+        for piece in entry:gmatch("[^,]+") do
+            pieces[#pieces + 1] = trim(piece)
+        end
+        local name = table.remove(pieces, 1)
+        if name and name ~= "" then
+            local args = {}
+            for _, s in ipairs(pieces) do
+                args[#args + 1] = coerce(s)
+            end
+            calls[#calls + 1] = {name = name, args = args}
+        end
+    end
+    return calls
+end
+
+local function runBuyCalls()
+    for _, call in ipairs(parseCalls(config.BuyCalls)) do
+        local remote = ReplicatedStorage:FindFirstChild(call.name, true)
+        if remote then
+            pcall(function()
+                if remote:IsA("RemoteFunction") then
+                    remote:InvokeServer(table.unpack(call.args))
+                elseif remote:IsA("RemoteEvent") then
+                    remote:FireServer(table.unpack(call.args))
+                end
+            end)
+        end
+    end
+end
+
+local function captureLast()
+    if not lastCapture then
+        notify("Capture", "Nothing logged yet. Turn on Remote Logger and buy something.", 5)
+        return
+    end
+    local entry = lastCapture.name
+    if lastCapture.args ~= "" then
+        entry = entry .. "," .. lastCapture.args
+    end
+    if config.BuyCalls ~= "" then
+        config.BuyCalls = config.BuyCalls .. ";" .. entry
+    else
+        config.BuyCalls = entry
+    end
+    copyText(config.BuyCalls)
+    notify("Capture", "Added: " .. entry, 5)
+end
+
+local function dumpLayout()
+    local out = {"[Workspace]"}
+    for _, c in ipairs(Workspace:GetChildren()) do
+        out[#out + 1] = c.ClassName .. " " .. c.Name
+    end
+    out[#out + 1] = "[ReplicatedStorage remotes]"
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+            out[#out + 1] = d.ClassName .. " " .. d:GetFullName()
+        end
+    end
+    return table.concat(out, "\n")
+end
+
+local espObjects = {}
+local espSession = 0
+
+local function destroyESP(o)
+    if o.h then
+        o.h:Destroy()
+    end
+    if o.g then
+        o.g:Destroy()
+    end
+end
+
+local function clearESP()
+    for _, o in pairs(espObjects) do
+        destroyESP(o)
+    end
+    table.clear(espObjects)
+end
+
+local function createESP(m, isBoss)
+    local head = m:FindFirstChild("Head")
+    if not head then
+        return nil
+    end
+    local g = Instance.new("BillboardGui")
+    g.Adornee = head
+    g.AlwaysOnTop = true
+    g.Size = UDim2.fromOffset(110, 14)
+    g.StudsOffset = Vector3.new(0, 2.2, 0)
+    g.Parent = head
+
+    local t = Instance.new("TextLabel")
+    t.BackgroundTransparency = 1
+    t.Size = UDim2.fromScale(1, 1)
+    t.Font = Enum.Font.GothamMedium
+    t.TextSize = 11
+    t.Text = m.Name
+    t.TextColor3 = isBoss and Color3.fromRGB(255, 190, 80) or Color3.fromRGB(255, 255, 255)
+    t.TextStrokeTransparency = 0.5
+    t.Parent = g
+
+    return {g = g, label = t, boss = isBoss, h = nil}
+end
+
+local function setHighlight(o, m, on)
+    if on and not o.h then
+        local h = Instance.new("Highlight")
+        h.Adornee = m
+        h.FillColor = o.boss and Color3.fromRGB(255, 170, 0) or Color3.fromRGB(255, 50, 50)
+        h.OutlineColor = Color3.fromRGB(255, 255, 255)
+        h.FillTransparency = 0.5
+        h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        h.Parent = m
+        o.h = h
+    elseif not on and o.h then
+        o.h:Destroy()
+        o.h = nil
+    end
+end
+
+local function updateESP()
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local list = {}
+    for m, info in pairs(tracked) do
+        if isAlive(m) then
+            local d = root and (root.Position - m.HumanoidRootPart.Position).Magnitude or 0
+            list[#list + 1] = {m = m, boss = info.boss, d = d}
+        end
+    end
+    table.sort(list, function(a, b)
+        return a.d < b.d
+    end)
+    local keepSet = {}
+    for i, e in ipairs(list) do
+        keepSet[e.m] = true
+        local o = espObjects[e.m]
+        if not o then
+            o = createESP(e.m, e.boss)
+            espObjects[e.m] = o
+        end
+        if o then
+            if config.ESPDistance then
+                o.label.Text = string.format("%s [%dm]", e.m.Name, math.floor(e.d + 0.5))
+            else
+                o.label.Text = e.m.Name
+            end
+            setHighlight(o, e.m, i <= ESP_HIGHLIGHT_MAX)
+        end
+    end
+    for m, o in pairs(espObjects) do
+        if not keepSet[m] then
+            destroyESP(o)
+            espObjects[m] = nil
+        end
+    end
+end
+
+local function rejoin()
+    local ok = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+    end)
+    if not ok then
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, player)
+        end)
+    end
+end
+
+local function serverHop()
+    local ok, servers = pcall(function()
+        local body = game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
+        return HttpService:JSONDecode(body).data
+    end)
+    if ok and type(servers) == "table" then
+        for _, s in ipairs(servers) do
+            if s.id ~= game.JobId and s.playing < s.maxPlayers - 1 then
+                local sent = pcall(function()
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, s.id, player)
+                end)
+                if sent then
+                    return
+                end
+            end
+        end
+    end
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId, player)
+    end)
+end
+
+local powerSession = 0
+local buySession = 0
+
+local function panic()
+    stopFarm()
+    config.AutoBuy = false
+    buySession = buySession + 1
+    config.AutoPowerups = false
+    powerSession = powerSession + 1
+    notify("Panic", "Farm, auto buy and powerups stopped.", 4)
+end
+
+local sWave = statsTab:Section("Wave: -")
+local sAlive = statsTab:Section("Zombies alive: 0")
+local sKills = statsTab:Section("Kills: 0")
+local sRate = statsTab:Section("Kills/min: 0.0")
+local sShots = statsTab:Section("Shots: 0")
+local sCash = statsTab:Section("Cash: n/a")
+local sTime = statsTab:Section("Runtime: 00:00:00")
+
+local function setStat(obj, text)
+    pcall(function()
+        if obj and obj.Set then
+            obj:Set(text)
+        elseif obj and obj.SetText then
+            obj:SetText(text)
         end
     end)
+end
+
+local function refreshStats()
+    local t = statsText()
+    setStat(sWave, t.wave)
+    setStat(sAlive, t.alive)
+    setStat(sKills, t.kills)
+    setStat(sRate, t.rate)
+    setStat(sShots, t.shots)
+    setStat(sCash, t.cash)
+    setStat(sTime, t.time)
+end
+
+statsTab:Button("Show Stats", function()
+    local t = statsText()
+    notify("Stats", t.wave .. " | " .. t.kills .. " | " .. t.rate .. " | " .. t.cash .. " | " .. t.time, 7)
+end)
+
+statsTab:Button("Reset Stats", function()
+    kills = 0
+    shots = 0
+    cleared = 0
+    runAccum = 0
+    if runStart then
+        runStart = os.clock()
+    end
+    if cashValue and cashValue.Parent then
+        cashStart = cashValue.Value
+    end
+    refreshStats()
+end)
+
+farmTab:Section("Lock & Kill")
+
+farmTab:Toggle("AutoFarm Lock (Spam Kill)", false, function(state)
+    if state then
+        startFarm()
+    else
+        stopFarm()
+    end
 end)
 
 farmTab:Toggle("Multi-Target Volley (no switch delay)", config.MultiTarget, function(state)
@@ -368,12 +1013,16 @@ farmTab:Slider("Max Targets Per Volley", 1, 8, math.clamp(config.MaxTargets, 1, 
     config.MaxTargets = v
 end)
 
+farmTab:Toggle("Boss Priority", config.BossPriority, function(state)
+    config.BossPriority = state
+end)
+
 farmTab:Toggle("Auto Equip Tool", config.AutoEquip, function(state)
     config.AutoEquip = state
 end)
 
-farmTab:Toggle("Boss Priority", config.BossPriority, function(state)
-    config.BossPriority = state
+farmTab:Textbox("Preferred Tool Name (blank = first)", true, function(t)
+    config.PreferredTool = trim(t)
 end)
 
 farmTab:Section("Waves")
@@ -391,11 +1040,11 @@ farmTab:Toggle("Retreat On Low Health", config.SafeEnabled, function(state)
     end
 end)
 
-farmTab:Slider("Retreat Below (%)", 5, 90, config.SafeBelow, function(v)
+farmTab:Slider("Retreat Below (%)", 5, 90, math.clamp(config.SafeBelow, 5, 90), function(v)
     config.SafeBelow = v
 end)
 
-farmTab:Slider("Resume Above (%)", 20, 100, config.SafeResume, function(v)
+farmTab:Slider("Resume Above (%)", 20, 100, math.clamp(config.SafeResume, 20, 100), function(v)
     config.SafeResume = v
 end)
 
@@ -404,8 +1053,15 @@ farmTab:Button("Set Safe Spot Here", function()
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if root then
         safePos = root.Position
-        lib:Notification("Safe Spot", "Position saved.", 3)
+        safeCustom = true
+        notify("Safe Spot", "Position saved.", 3)
     end
+end)
+
+farmTab:Button("Reset Safe Spot", function()
+    safePos = nil
+    safeCustom = false
+    notify("Safe Spot", "Reset. Uses the spot above where you start farming.", 4)
 end)
 
 farmTab:Section("Tuning")
@@ -422,131 +1078,118 @@ farmTab:Slider("Fire Delay (ms)", 20, 200, math.clamp(math.floor(getgenv().FireD
     getgenv().FireDelay = v / 1000
 end)
 
-local function statsText()
-    local e = elapsed()
-    local s = math.floor(e)
-    local rate = e > 0 and kills / (e / 60) or 0
-    return {
-        kills = "Kills: " .. kills,
-        rate = string.format("Kills/min: %.1f", rate),
-        shots = "Shots: " .. shots,
-        time = string.format("Runtime: %02d:%02d:%02d", s // 3600, (s % 3600) // 60, s % 60),
-    }
-end
+itemsTab:Section("Powerups")
 
-local sKills = statsTab:Section("Kills: 0")
-local sRate = statsTab:Section("Kills/min: 0.0")
-local sShots = statsTab:Section("Shots: 0")
-local sTime = statsTab:Section("Runtime: 00:00:00")
-
-local function setStat(obj, text)
-    pcall(function()
-        if obj.Set then
-            obj:Set(text)
-        elseif obj.SetText then
-            obj:SetText(text)
+itemsTab:Toggle("Auto Collect Powerups", false, function(state)
+    config.AutoPowerups = state
+    powerSession = powerSession + 1
+    local current = powerSession
+    if not state then
+        return
+    end
+    task.spawn(function()
+        while alive and config.AutoPowerups and powerSession == current do
+            pcall(collectPowerups, 10)
+            task.wait(0.6)
         end
     end)
-end
-
-statsTab:Button("Show Stats", function()
-    local t = statsText()
-    lib:Notification("Stats", t.kills .. " | " .. t.rate .. " | " .. t.shots .. " | " .. t.time, 6)
 end)
 
-statsTab:Button("Reset Stats", function()
-    kills = 0
-    shots = 0
-    runAccum = 0
-    if runStart then
-        runStart = os.clock()
+itemsTab:Textbox("Powerup Folder Name (blank = auto detect)", true, function(t)
+    config.PowerupName = trim(t)
+end)
+
+itemsTab:Button("Collect Now", function()
+    local n = collectPowerups(25)
+    notify("Powerups", n > 0 and ("Touched " .. n .. " pickup(s).") or "No pickups found. Use Dump Layout to find the folder name.", 5)
+end)
+
+itemsTab:Section("Auto Buy / Upgrade")
+
+itemsTab:Textbox("Buy Calls (Remote,arg,arg;Remote2,arg)", true, function(t)
+    config.BuyCalls = trim(t)
+end)
+
+itemsTab:Slider("Buy Interval (s)", 1, 30, math.clamp(config.BuyDelay, 1, 30), function(v)
+    config.BuyDelay = v
+end)
+
+itemsTab:Toggle("Buy Only Between Waves", config.BuyBetweenWaves, function(state)
+    config.BuyBetweenWaves = state
+end)
+
+itemsTab:Toggle("Auto Buy", false, function(state)
+    config.AutoBuy = state
+    buySession = buySession + 1
+    local current = buySession
+    if not state then
+        return
+    end
+    task.spawn(function()
+        while alive and config.AutoBuy and buySession == current do
+            if config.BuyCalls ~= "" and (not config.BuyBetweenWaves or idleNow) then
+                runBuyCalls()
+            end
+            task.wait(config.BuyDelay)
+        end
+    end)
+end)
+
+itemsTab:Section("Discovery")
+
+itemsTab:Toggle("Remote Logger (buy a gun, then Capture)", false, function(state)
+    if state then
+        if not installHook() then
+            logging = false
+            notify("Logger", "This executor lacks hookmetamethod.", 5)
+            return
+        end
+        logging = true
+    else
+        logging = false
     end
 end)
 
-local statsAlive = true
+itemsTab:Button("Capture Last Logged Call -> Buy List", captureLast)
 
-task.spawn(function()
-    while statsAlive do
-        local t = statsText()
-        setStat(sKills, t.kills)
-        setStat(sRate, t.rate)
-        setStat(sShots, t.shots)
-        setStat(sTime, t.time)
-        task.wait(1)
+itemsTab:Button("Copy Remote Log", function()
+    if #logLines == 0 then
+        notify("Log", "Log is empty.", 3)
+        return
     end
+    notify("Log", copyText(table.concat(logLines, "\n")) and "Copied to clipboard." or "No clipboard access.", 3)
 end)
 
-local espSession = 0
-local espObjects = {}
+itemsTab:Button("Clear Buy List", function()
+    config.BuyCalls = ""
+    notify("Buy List", "Cleared.", 3)
+end)
 
-local function clearESP()
-    for _, e in pairs(espObjects) do
-        e.h:Destroy()
-        e.g:Destroy()
-    end
-    table.clear(espObjects)
-end
-
-local function addESP(m, isBoss)
-    local h = Instance.new("Highlight")
-    h.Adornee = m
-    h.FillColor = isBoss and Color3.fromRGB(255, 170, 0) or Color3.fromRGB(255, 50, 50)
-    h.OutlineColor = Color3.fromRGB(255, 255, 255)
-    h.FillTransparency = 0.5
-    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    h.Parent = m
-
-    local g = Instance.new("BillboardGui")
-    g.Adornee = m.Head
-    g.AlwaysOnTop = true
-    g.Size = UDim2.fromOffset(90, 14)
-    g.StudsOffset = Vector3.new(0, 2.2, 0)
-    g.Parent = m.Head
-
-    local t = Instance.new("TextLabel")
-    t.BackgroundTransparency = 1
-    t.Size = UDim2.fromScale(1, 1)
-    t.Font = Enum.Font.GothamMedium
-    t.TextSize = 11
-    t.Text = m.Name
-    t.TextColor3 = Color3.fromRGB(255, 255, 255)
-    t.TextStrokeTransparency = 0.5
-    t.Parent = g
-
-    espObjects[m] = {h = h, g = g}
-end
+itemsTab:Button("Dump Workspace + Remotes", function()
+    local text = dumpLayout()
+    notify("Layout", copyText(text) and "Copied to clipboard." or "No clipboard access.", 4)
+end)
 
 visualTab:Section("ESP")
 
 visualTab:Toggle("Zombie ESP", false, function(state)
     config.ESP = state
-    espSession += 1
+    espSession = espSession + 1
     local current = espSession
-
     if not state then
         clearESP()
         return
     end
-
     task.spawn(function()
-        while config.ESP and espSession == current do
-            for _, folder in ipairs(allFolders) do
-                for _, m in ipairs(folder:GetChildren()) do
-                    if m:IsA("Model") and isAlive(m) and not espObjects[m] then
-                        addESP(m, folder == bossFolder)
-                    end
-                end
-            end
-            for m, e in pairs(espObjects) do
-                if not isAlive(m) then
-                    e.h:Destroy()
-                    e.g:Destroy()
-                    espObjects[m] = nil
-                end
-            end
-            task.wait(0.5)
+        while alive and config.ESP and espSession == current do
+            pcall(updateESP)
+            task.wait(0.4)
         end
     end)
+end)
+
+visualTab:Toggle("Show Distance", config.ESPDistance, function(state)
+    config.ESPDistance = state
 end)
 
 miscTab:Section("Utility")
@@ -555,111 +1198,17 @@ miscTab:Toggle("Anti AFK", config.AntiAFK, function(state)
     config.AntiAFK = state
 end)
 
-local idledConnection = player.Idled:Connect(function()
+keep(player.Idled:Connect(function()
     if config.AntiAFK then
         VirtualUser:CaptureController()
         VirtualUser:ClickButton2(Vector2.new())
     end
-end)
+end))
 
-local function parseArgs(raw)
-    local args = {}
-    if raw == "" then
-        return args
-    end
-    for piece in raw:gmatch("[^,]+") do
-        local s = piece:match("^%s*(.-)%s*$")
-        local n = tonumber(s)
-        if n then
-            table.insert(args, n)
-        elseif s == "true" then
-            table.insert(args, true)
-        elseif s == "false" then
-            table.insert(args, false)
-        else
-            table.insert(args, (s:gsub("^[\"'](.*)[\"']$", "%1")))
-        end
-    end
-    return args
-end
+miscTab:Bind("Panic Key (stop everything)", Enum.KeyCode.End, panic)
 
-local function scanRemotes()
-    local found = {}
-    local keywords = {"shop", "buy", "purchase", "upgrade", "weapon", "gun", "ammo", "perk", "unlock", "equip"}
-    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-            local n = d.Name:lower()
-            for _, k in ipairs(keywords) do
-                if n:find(k, 1, true) then
-                    table.insert(found, d.Name)
-                    break
-                end
-            end
-        end
-    end
-    return found
-end
-
-local buySession = 0
-
-miscTab:Section("Auto Buy / Upgrade")
-
-miscTab:Textbox("Remote Name", true, function(t)
-    config.BuyRemote = t
-end)
-
-miscTab:Textbox("Arguments (comma separated)", true, function(t)
-    config.BuyArgs = t
-end)
-
-miscTab:Slider("Buy Interval (s)", 1, 30, math.clamp(config.BuyDelay, 1, 30), function(v)
-    config.BuyDelay = v
-end)
-
-miscTab:Toggle("Buy Only Between Waves", config.BuyBetweenWaves, function(state)
-    config.BuyBetweenWaves = state
-end)
-
-miscTab:Toggle("Auto Buy", false, function(state)
-    config.AutoBuy = state
-    buySession += 1
-    local current = buySession
-
-    if not state then
-        return
-    end
-
-    task.spawn(function()
-        while config.AutoBuy and buySession == current do
-            if config.BuyRemote ~= "" and (not config.BuyBetweenWaves or isIdle) then
-                local remote = ReplicatedStorage:FindFirstChild(config.BuyRemote, true)
-                if remote then
-                    local args = parseArgs(config.BuyArgs)
-                    pcall(function()
-                        if remote:IsA("RemoteFunction") then
-                            remote:InvokeServer(table.unpack(args))
-                        elseif remote:IsA("RemoteEvent") then
-                            remote:FireServer(table.unpack(args))
-                        end
-                    end)
-                end
-            end
-            task.wait(config.BuyDelay)
-        end
-    end)
-end)
-
-miscTab:Button("Scan Shop Remotes", function()
-    local found = scanRemotes()
-    if #found == 0 then
-        lib:Notification("Remotes", "No matching remotes found.", 4)
-        return
-    end
-    if typeof(setclipboard) == "function" then
-        setclipboard(table.concat(found, "\n"))
-    end
-    lib:Notification("Remotes", table.concat(found, ", ", 1, math.min(#found, 10)), 6)
-end)
+miscTab:Button("Rejoin Server", rejoin)
+miscTab:Button("Server Hop", serverHop)
 
 miscTab:Section("Scripts")
 miscTab:Button("Infinite Yield", function()
@@ -676,7 +1225,7 @@ end)
 miscTab:Section("Info")
 miscTab:Label("created by: @nondevelopers")
 miscTab:Label("Discord: nonfq")
-miscTab:Label("Version: v2")
+miscTab:Label("Version: v3")
 
 settingsTab:Section("Appearance")
 
@@ -691,32 +1240,114 @@ end)
 
 settingsTab:Section("Config")
 
+settingsTab:Toggle("Auto Save On Close", config.AutoSave, function(state)
+    config.AutoSave = state
+end)
+
 settingsTab:Button("Save Config", function()
     if saveConfig() then
-        lib:Notification("Config", "Saved.", 3)
+        notify("Config", "Saved.", 3)
     else
-        lib:Notification("Config", "Save failed (no file access).", 4)
+        notify("Config", "Save failed (no file access).", 4)
     end
 end)
 
 settingsTab:Button("Load Config", function()
     if loadConfig() then
-        lib:Notification("Config", "Loaded. Sliders sync on next execute.", 4)
+        notify("Config", "Loaded. Sliders sync on next execute.", 4)
     else
-        lib:Notification("Config", "No saved config found.", 4)
+        notify("Config", "No saved config found.", 4)
     end
 end)
+
+local function shutdown(save)
+    if save and config.AutoSave then
+        saveConfig()
+    end
+    alive = false
+    stopFarm()
+    config.ESP = false
+    espSession = espSession + 1
+    clearESP()
+    config.AutoBuy = false
+    buySession = buySession + 1
+    config.AutoPowerups = false
+    powerSession = powerSession + 1
+    logging = false
+    getgenv().ZA_Record = nil
+    for _, state in ipairs(folderStates) do
+        for _, c in ipairs(state.conns) do
+            pcall(function()
+                c:Disconnect()
+            end)
+        end
+    end
+    for m in pairs(tracked) do
+        untrack(m)
+    end
+    for _, c in ipairs(conns) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    pcall(function()
+        lib:Destroy()
+    end)
+    getgenv().ZA_Shutdown = nil
+end
+
+getgenv().ZA_Shutdown = function()
+    shutdown(false)
+end
 
 settingsTab:Section("Danger Zone")
 
 settingsTab:Button("Fully Close", function()
-    stopFarm()
-    statsAlive = false
-    config.ESP = false
-    espSession += 1
-    clearESP()
-    config.AutoBuy = false
-    buySession += 1
-    idledConnection:Disconnect()
-    lib:Destroy()
+    shutdown(true)
 end)
+
+task.spawn(function()
+    local emptyFor, had, tick = 0, false, 0
+    while alive do
+        for _, state in ipairs(folderStates) do
+            local f = Workspace:FindFirstChild(state.name)
+            if f ~= state.folder then
+                state.attach(f)
+            end
+        end
+        for m in pairs(tracked) do
+            if not m:IsDescendantOf(Workspace) then
+                untrack(m)
+            end
+        end
+
+        local n = aliveCount()
+        idleNow = n == 0
+        if n == 0 then
+            emptyFor = emptyFor + 1
+        else
+            if had and emptyFor >= 3 then
+                cleared = cleared + 1
+            end
+            emptyFor = 0
+            had = true
+        end
+
+        if not cashValue or not cashValue.Parent then
+            cashValue = findCash()
+            if cashValue then
+                cashStart = cashValue.Value
+            end
+        end
+
+        tick = tick + 1
+        if not readWave() and tick % 5 == 1 then
+            pcall(scanWave)
+        end
+
+        refreshStats()
+        task.wait(1)
+    end
+end)
+
+notify("Zombie Attack", "Loaded.", 3)
