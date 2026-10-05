@@ -6,7 +6,7 @@ local FALLBACK = "hub.luau"
 local SUPPORTED = {
    [79393329652220] = "games/Defusal.luau",
    [1240123653] = "games/ZombieAttack.luau", -- Easy Mode
-   [1632210982] = "games/ZombieAttack.luau", -- Hard mode
+   [504035427] = "games/ZombieAttack.luau", -- Hard mode
 }
 
 local env = getgenv()
